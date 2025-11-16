@@ -2,6 +2,7 @@ import os
 import sys
 import csv
 import pymysql
+import argparse
 
 
 def env(name: str, default: str = "") -> str:
@@ -11,34 +12,18 @@ def env(name: str, default: str = "") -> str:
     return v
 
 
-def create_database_and_user():
-    """
-    Creates the database, app user, and grants in MariaDB/Aurora MySQL.
+def create_database_and_user(args):
+    admin_host = args.admin_host or env("ADMIN_HOST")
+    admin_user = args.admin_user or env("ADMIN_USER")
+    admin_password = args.admin_password or env("ADMIN_PASSWORD")
+    admin_port = int(args.admin_port or env("ADMIN_PORT", "3306"))
 
-    Required environment variables:
-      - ADMIN_HOST            e.g. database-1.xxxx.ap-south-1.rds.amazonaws.com
-      - ADMIN_USER            e.g. admin
-      - ADMIN_PASSWORD
-      - DB_NAME               e.g. scrapeddataNSE
+    db_name = args.db_name or env("DB_NAME")
+    app_user = args.app_user or env("APP_USER", "app_user")
+    app_password = args.app_password or env("APP_PASSWORD", "StrongPassword!")
 
-    Optional:
-      - ADMIN_PORT            default 3306
-      - APP_USER              default app_user
-      - APP_PASSWORD          default StrongPassword!
-      - OPTION_CHAIN_TABLE    default option_chain
-      - CSV_SCHEMA_PATH       if set, use CSV header to create table columns (VARCHAR(255))
-    """
-    admin_host = env("ADMIN_HOST")
-    admin_user = env("ADMIN_USER")
-    admin_password = env("ADMIN_PASSWORD")
-    admin_port = int(env("ADMIN_PORT", "3306"))
-
-    db_name = env("DB_NAME")
-    app_user = env("APP_USER", "app_user")
-    app_password = env("APP_PASSWORD", "StrongPassword!")
-
-    table_name = env("OPTION_CHAIN_TABLE", "option_chain")
-    csv_schema_path = env("CSV_SCHEMA_PATH", "")
+    table_name = args.table or env("OPTION_CHAIN_TABLE", "option_chain")
+    csv_schema_path = args.csv_schema or env("CSV_SCHEMA_PATH", "")
 
     missing = [k for k, v in [
         ("ADMIN_HOST", admin_host),
@@ -51,12 +36,15 @@ def create_database_and_user():
         sys.exit(1)
 
     print(f"Connecting to {admin_host}:{admin_port} as {admin_user} ...")
+
+    # Use RDS CA bundle for SSL
     conn = pymysql.connect(
         host=admin_host,
         user=admin_user,
         password=admin_password,
         port=admin_port,
         autocommit=True,
+        ssl={"ca": "/usr/local/share/ca-certificates/rds-ca.pem"},
         cursorclass=pymysql.cursors.Cursor,
     )
 
@@ -66,12 +54,18 @@ def create_database_and_user():
             cur.execute(f"CREATE DATABASE IF NOT EXISTS `{db_name}` DEFAULT CHARACTER SET utf8mb4;")
             print(f"Database ensured: {db_name}")
 
-            # Create user
-            cur.execute(f"CREATE USER IF NOT EXISTS '{app_user}'@'%' IDENTIFIED BY %s;", (app_password,))
+            # Create user (parameterize user and host to avoid % interpolation issues)
+            cur.execute(
+                "CREATE USER IF NOT EXISTS %s@%s IDENTIFIED BY %s;",
+                (app_user, "%", app_password)
+            )
             print(f"User ensured: {app_user}")
 
             # Grants
-            cur.execute(f"GRANT INSERT, SELECT, CREATE, ALTER ON `{db_name}`.* TO '{app_user}'@'%';")
+            cur.execute(
+                f"GRANT INSERT, SELECT, CREATE, ALTER ON `{db_name}`.* TO %s@%s;",
+                (app_user, "%")
+            )
             cur.execute("FLUSH PRIVILEGES;")
             print(f"Granted privileges on {db_name} to {app_user}")
 
@@ -83,19 +77,81 @@ def create_database_and_user():
                 if not headers:
                     print(f"No headers found in CSV {csv_schema_path}; skipping table creation.")
                 else:
-                    # Build columns as VARCHAR(255)
                     col_defs = ", ".join([f"`{h}` VARCHAR(255)" for h in headers])
                     cur.execute(f"CREATE TABLE IF NOT EXISTS `{db_name}`.`{table_name}` ({col_defs});")
-                    print(f"Table ensured: {db_name}.{table_name} (from CSV headers)")
+                    print(f"Table ensured: {db_name}.{table_name}")
             else:
-                print("No CSV_SCHEMA_PATH provided; skipping table creation (pandas will auto-create on first write).")
+                print("No CSV schema; skipping table creation.")
 
     finally:
         conn.close()
         print("Done.")
 
 
+def test_app_connection(host: str, port: int, db_name: str, app_user: str, app_password: str) -> bool:
+    print(f"Testing app user connection to {host}:{port}/{db_name} as {app_user} ...")
+    try:
+        # Use RDS CA bundle for SSL
+        conn = pymysql.connect(
+            host=host,
+            user=app_user,
+            password=app_password,
+            database=db_name,
+            port=port,
+            autocommit=True,
+            ssl={"ca": "/usr/local/share/ca-certificates/rds-ca.pem"},
+            cursorclass=pymysql.cursors.Cursor,
+        )
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1;")
+                row = cur.fetchone()
+                if row and row[0] == 1:
+                    print("App user connectivity OK (SELECT 1).")
+                    return True
+                else:
+                    print(f"Unexpected SELECT 1 result: {row}")
+                    return False
+        finally:
+            conn.close()
+    except pymysql.MySQLError as e:
+        print(f"App user connection failed: {e}")
+        return False
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Setup MariaDB/Aurora MySQL.")
+    parser.add_argument("--admin-host")
+    parser.add_argument("--admin-user")
+    parser.add_argument("--admin-password")
+    parser.add_argument("--admin-port")
+
+    parser.add_argument("--db-name")
+    parser.add_argument("--app-user")
+    parser.add_argument("--app-password")
+
+    parser.add_argument("--table")
+    parser.add_argument("--csv-schema")
+
+    parser.add_argument("--print-url", action="store_true")
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    create_database_and_user()
+    args = parse_args()
+    create_database_and_user(args)
 
+    host = args.admin_host or env("ADMIN_HOST")
+    port = int(args.admin_port or env("ADMIN_PORT", "3306"))
+    db = args.db_name or env("DB_NAME")
+    app_user = args.app_user or env("APP_USER", "app_user")
+    app_password = args.app_password or env("APP_PASSWORD", "StrongPassword!")
 
+    if test_app_connection(host, port, db, app_user, app_password):
+        url = f"mysql+pymysql://{app_user}:{app_password}@{host}:{port}/{db}"
+        print("Setup complete.")
+        if args.print_url:
+            print("DATABASE_URL:")
+            print(url)
+    else:
+        print("Setup completed, but app user connectivity failed.")
