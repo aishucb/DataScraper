@@ -2,3 +2,7 @@ pytz
 requests
 pandas
 schedule
+SQLAlchemy>=2.0
+# One of these depending on your RDS engine; safe to keep both if unsure
+psycopg2-binary>=2.9
+PyMySQL>=1.1

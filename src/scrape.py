@@ -7,6 +7,8 @@ import os
 from datetime import datetime, time as dtime
 import pytz
 from requests.exceptions import RequestException
+from sqlalchemy.exc import SQLAlchemyError
+from typing import Optional
 
 # Make sure src is on PYTHONPATH for relative imports when run via cron
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -14,6 +16,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from config.nse_holidays import NSE_HOLIDAYS_2024
 from src.nse_scraper import fetch_all_option_chain, format_for_nautilus
 from src.utils.utils import is_nse_holiday
+from src.db import get_engine
 
 # List of fields not required in output while displaying option chain data
 EXCLUDE_KEYS = [
@@ -139,6 +142,12 @@ def get_market_status():
 
 # ---------- Main scraper ----------
 def main():
+    # Config via environment
+    write_csv = os.environ.get('WRITE_CSV', 'true').lower() == 'true'
+    write_db = os.environ.get('WRITE_DB', 'true').lower() == 'true'
+    override_hours = os.environ.get('OVERRIDE_MARKET_HOURS', 'false').lower() == 'true'
+    table_name = os.environ.get('OPTION_CHAIN_TABLE', 'option_chain')
+
     today = datetime.now(pytz.timezone('Asia/Kolkata'))
     today_str = today.strftime('%Y-%m-%d')
 
@@ -146,9 +155,10 @@ def main():
     market_status = get_market_status()
     print(f"Current time: {market_status['current_time']} (IST)")
     print(f"Market hours: {market_status['market_open']} - {market_status['market_close']} IST")
+    print(f"Config -> WRITE_CSV={write_csv}, WRITE_DB={write_db}, OVERRIDE_MARKET_HOURS={override_hours}, TABLE={table_name}")
 
     # Check if market is open
-    if not is_market_hours():
+    if not override_hours and not is_market_hours():
         if market_status['is_weekend']:
             print(f"{today_str} is a weekend. Market is closed.")
         elif market_status['is_holiday']:
@@ -159,6 +169,12 @@ def main():
 
     ensure_output_dir()
     timestamp = today.strftime('%Y-%m-%d %H:%M:%S')
+    engine: Optional[object] = None
+    if write_db:
+        engine = get_engine()
+        if engine is None:
+            print("DATABASE_URL not set. Skipping DB write.")
+            write_db = False
 
     for symbol in SYMBOLS:
         print(f"Fetching {symbol} option chain...")
@@ -173,12 +189,21 @@ def main():
 
         if oc_rows:
             df = pd.DataFrame(oc_rows)
-            out_path = os.path.join(OUTPUT_DIR, f"{symbol}_{today_str}.csv")
-            if os.path.exists(out_path):
-                df.to_csv(out_path, mode='a', header=False, index=False)
-            else:
-                df.to_csv(out_path, index=False)
-            print(f"Saved {len(oc_rows)} rows to {out_path}")
+            if write_csv:
+                out_path = os.path.join(OUTPUT_DIR, f"{symbol}_{today_str}.csv")
+                if os.path.exists(out_path):
+                    df.to_csv(out_path, mode='a', header=False, index=False)
+                else:
+                    df.to_csv(out_path, index=False)
+                print(f"Saved {len(oc_rows)} rows to {out_path}")
+
+            # Save to RDS if configured
+            if write_db and engine is not None:
+                try:
+                    df.to_sql(table_name, con=engine, if_exists='append', index=False, method='multi', chunksize=1000)
+                    print(f"Inserted {len(df)} rows into database table '{table_name}'")
+                except SQLAlchemyError as db_err:
+                    print(f"Database write failed: {db_err}")
         else:
             print(f"No data for {symbol}")
 
