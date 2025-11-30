@@ -18,6 +18,12 @@ from src.nse_scraper import fetch_all_option_chain, format_for_nautilus
 from src.utils.utils import is_nse_holiday
 from src.db import get_engine
 
+# Twilio WhatsApp Configuration
+TWILIO_ACCOUNT_SID = 'AC67cffc84b0ffca0cb95e91604a4f13f8'  # Replace with your actual Account SID
+TWILIO_AUTH_TOKEN = 'da74f025d5742ae039d8dcc532c5dff0'
+TWILIO_WHATSAPP_TO = 'whatsapp:+919656554244'
+TWILIO_WHATSAPP_FROM = 'whatsapp:+14155238886'
+
 # List of fields not required in output while displaying option chain data
 EXCLUDE_KEYS = [
     'pchangeinOpenInterest', 'totalBuyQuantity', 'totalSellQuantity',
@@ -140,6 +146,88 @@ def get_market_status():
         'is_holiday': is_nse_holiday(now.strftime('%Y-%m-%d'))
     }
 
+# ---------- WhatsApp Notification Functions ----------
+def send_whatsapp_notification(message: str) -> bool:
+    """Send WhatsApp notification via Twilio API."""
+    url = f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_ACCOUNT_SID}/Messages.json"
+    
+    try:
+        response = requests.post(
+            url,
+            data={
+                'To': TWILIO_WHATSAPP_TO,
+                'From': TWILIO_WHATSAPP_FROM,
+                'Body': message
+            },
+            auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
+            timeout=10
+        )
+        response.raise_for_status()
+        print(f"✅ WhatsApp notification sent successfully (Status: {response.status_code})")
+        return True
+    except requests.exceptions.HTTPError as e:
+        error_detail = ""
+        try:
+            error_detail = response.json() if hasattr(e, 'response') and e.response else ""
+        except:
+            pass
+        print(f"❌ Failed to send WhatsApp notification (HTTP {response.status_code if 'response' in locals() else 'N/A'}): {e}")
+        if error_detail:
+            print(f"   Twilio error details: {error_detail}")
+        return False
+    except Exception as e:
+        # Don't raise - notification failures shouldn't break the scraper
+        print(f"❌ Failed to send WhatsApp notification: {e}")
+        return False
+
+
+def notify_error(error_type: str, error_message: str, context: Optional[str] = None) -> None:
+    """Format and send error notification via WhatsApp."""
+    timestamp = datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%Y-%m-%d %H:%M:%S IST')
+    
+    msg_parts = [
+        f"🚨 DataScraper Error",
+        f"Time: {timestamp}",
+        f"Type: {error_type}"
+    ]
+    
+    if context:
+        msg_parts.append(f"Context: {context}")
+    
+    msg_parts.append(f"Error: {error_message}")
+    
+    message = "\n".join(msg_parts)
+    send_whatsapp_notification(message)
+
+
+def send_test_notification():
+    """Send a test WhatsApp message to verify notification setup."""
+    print("Testing WhatsApp notification setup...")
+    print(f"Account SID: {TWILIO_ACCOUNT_SID[:10]}...")
+    print(f"To: {TWILIO_WHATSAPP_TO}")
+    print(f"From: {TWILIO_WHATSAPP_FROM}")
+    
+    timestamp = datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%Y-%m-%d %H:%M:%S IST')
+    
+    test_message = (
+        "✅ DataScraper Test Message\n"
+        f"Time: {timestamp}\n"
+        "This is a test notification to verify WhatsApp setup is working correctly.\n"
+        "If you receive this, notifications are configured properly!"
+    )
+    
+    result = send_whatsapp_notification(test_message)
+    if result:
+        print("✅ Test message sent successfully! Check your WhatsApp.")
+    else:
+        print("❌ Failed to send test message. Check Twilio configuration in scrape.py")
+        print("   Make sure:")
+        print("   1. TWILIO_ACCOUNT_SID is correct")
+        print("   2. TWILIO_AUTH_TOKEN is correct")
+        print("   3. WhatsApp numbers are in format: whatsapp:+1234567890")
+        print("   4. Your Twilio account has WhatsApp enabled")
+    return result
+
 # ---------- Main scraper ----------
 def main():
     # Config via environment
@@ -171,9 +259,15 @@ def main():
     timestamp = today.strftime('%Y-%m-%d %H:%M:%S')
     engine: Optional[object] = None
     if write_db:
-        engine = get_engine()
-        if engine is None:
-            print("DATABASE_URL not set. Skipping DB write.")
+        try:
+            engine = get_engine()
+            if engine is None:
+                print("DATABASE_URL not set. Skipping DB write.")
+                write_db = False
+        except Exception as e:
+            error_msg = str(e)
+            print(f"Failed to initialize database connection: {error_msg}")
+            notify_error("Database Connection Error", error_msg)
             write_db = False
 
     for symbol in SYMBOLS:
@@ -184,7 +278,9 @@ def main():
             for row in format_for_nautilus(all_options, symbol, EXCHANGE, timestamp):
                 oc_rows.append(row)
         except Exception as e:
-            print(f"Error fetching {symbol}: {e}")
+            error_msg = str(e)
+            print(f"Error fetching {symbol}: {error_msg}")
+            notify_error("NSE API Error", error_msg, f"Symbol: {symbol}")
             continue
 
         if oc_rows:
@@ -203,12 +299,22 @@ def main():
                     df.to_sql(table_name, con=engine, if_exists='append', index=False, method='multi', chunksize=1000)
                     print(f"Inserted {len(df)} rows into database table '{table_name}'")
                 except SQLAlchemyError as db_err:
-                    print(f"Database write failed: {db_err}")
+                    error_msg = str(db_err)
+                    print(f"Database write failed: {error_msg}")
+                    notify_error("Database Write Error", error_msg, f"Symbol: {symbol}, Table: {table_name}")
         else:
             print(f"No data for {symbol}")
 
+
 if __name__ == '__main__':
-    try:
-        main()
-    except Exception as e:
-        print(f"Error: {e}\n")
+    # Check for test notification flag
+    if len(sys.argv) > 1 and sys.argv[1] == '--test-notify':
+        send_test_notification()
+    else:
+        try:
+            main()
+        except Exception as e:
+            error_msg = str(e)
+            print(f"Error: {error_msg}\n")
+            notify_error("Fatal Scraper Error", error_msg)
+            raise  # Re-raise so cron can see the failure
